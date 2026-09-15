@@ -3,6 +3,7 @@ using System.Drawing;
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Windows.Forms;
 
@@ -25,12 +26,13 @@ internal sealed class LauncherForm : Form
     private const string GameExe = "InfiniteAscension.exe";
     private const string GitHubUrl = "https://github.com/Mataiasu-Projects/Infinite-Ascension";
 
-    private readonly HttpClient http = new() { Timeout = TimeSpan.FromMinutes(10) };
+    private readonly HttpClient http = new() { Timeout = TimeSpan.FromMinutes(15) };
     private readonly Label serverLabel = new(), buildLabel = new(), statusLabel = new(), progressLabel = new();
     private readonly ProgressBar progress = new();
     private readonly Button playButton = new(), updateButton = new(), stopButton = new(), folderButton = new(), repairButton = new(), githubButton = new();
     private readonly Panel content = new(), nav = new(), home = new();
     private readonly System.Windows.Forms.Timer gameTimer = new() { Interval = 1000 };
+    private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 300000 };
 
     private Process? gameProcess;
     private bool busy;
@@ -41,6 +43,7 @@ internal sealed class LauncherForm : Form
     private string InstallRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "InfiniteAscension");
     private string GameRoot => Path.Combine(InstallRoot, "Game");
     private string GamePath => Path.Combine(GameRoot, GameExe);
+    private string LogPath => Path.Combine(InstallRoot, "launcher.log");
 
     public LauncherForm()
     {
@@ -54,7 +57,9 @@ internal sealed class LauncherForm : Form
         Font = new Font("Segoe UI", 10F);
         BuildUi();
         gameTimer.Tick += (_, _) => RefreshGameState();
+        updateTimer.Tick += async (_, _) => await BackgroundRefreshAsync();
         Shown += async (_, _) => await InitializeAsync();
+        FormClosing += (_, _) => { gameTimer.Stop(); updateTimer.Stop(); http.Dispose(); };
     }
 
     private void BuildUi()
@@ -116,7 +121,17 @@ internal sealed class LauncherForm : Form
 
     private async Task InitializeAsync()
     {
-        Directory.CreateDirectory(InstallRoot); Directory.CreateDirectory(GameRoot); gameTimer.Start();
+        Directory.CreateDirectory(InstallRoot); Directory.CreateDirectory(GameRoot);
+        Log("Launcher started.");
+        gameTimer.Start();
+        updateTimer.Start();
+        await RefreshManifestAsync();
+        if (autoUpdate && localBuild > 0 && remoteBuild > localBuild) await UpdateAsync(false);
+    }
+
+    private async Task BackgroundRefreshAsync()
+    {
+        if (busy || gameProcess is { HasExited: false }) return;
         await RefreshManifestAsync();
         if (autoUpdate && localBuild > 0 && remoteBuild > localBuild) await UpdateAsync(false);
     }
@@ -125,72 +140,141 @@ internal sealed class LauncherForm : Form
     {
         try
         {
-            using var response = await http.GetAsync(ManifestUrl); response.EnsureSuccessStatusCode();
-            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync()); var root = doc.RootElement;
-            remoteBuild = root.GetProperty("build").GetInt32(); remoteCommit = root.GetProperty("commit").GetString() ?? ""; localBuild = ReadLocalBuild();
+            using var response = await http.GetAsync(ManifestUrl + "?nocache=" + Guid.NewGuid().ToString("N"));
+            string body = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode) throw new HttpRequestException($"Manifest HTTP {(int)response.StatusCode}: {TrimForUi(body)}");
+            using var doc = JsonDocument.Parse(body); var root = doc.RootElement;
+            remoteBuild = root.GetProperty("build").GetInt32();
+            remoteCommit = root.GetProperty("commit").GetString() ?? "";
+            localBuild = ReadLocalBuild();
             serverLabel.Text = "Updater: online"; buildLabel.Text = $"Build {localBuild} → {remoteBuild}";
             statusLabel.Text = remoteBuild > localBuild ? "A game update is available." : "Game is up to date.";
+            Log($"Manifest OK: local={localBuild}, remote={remoteBuild}, commit={remoteCommit}");
         }
-        catch (Exception ex) { serverLabel.Text = "Updater: offline"; statusLabel.Text = "Updater unavailable: " + ex.Message; }
+        catch (Exception ex)
+        {
+            serverLabel.Text = "Updater: offline"; statusLabel.Text = "Updater unavailable: " + TrimForUi(ex.Message);
+            Log("Manifest failed: " + ex);
+        }
     }
 
     private int ReadLocalBuild()
     {
-        foreach (var path in new[] { Path.Combine(GameRoot, "build.json") })
+        try
         {
-            try { if (!File.Exists(path)) continue; using var doc = JsonDocument.Parse(File.ReadAllText(path)); if (doc.RootElement.TryGetProperty("build", out var b)) return b.GetInt32(); } catch { }
+            string path = Path.Combine(GameRoot, "build.json");
+            if (!File.Exists(path)) return 0;
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            return doc.RootElement.TryGetProperty("build", out var b) && b.TryGetInt32(out int value) ? value : 0;
         }
-        return 0;
+        catch (Exception ex) { Log("Read local build failed: " + ex.Message); return 0; }
     }
 
     private async Task PlayAsync()
     {
         if (busy) return;
-        if (!File.Exists(GamePath)) { await UpdateAsync(false); if (!File.Exists(GamePath)) return; }
-        try { gameProcess = Process.Start(new ProcessStartInfo(GamePath) { WorkingDirectory = GameRoot, UseShellExecute = true }); playButton.Enabled = false; statusLabel.Text = "Game running."; }
-        catch (Exception ex) { statusLabel.Text = "Failed to start game: " + ex.Message; }
+        if (!File.Exists(GamePath))
+        {
+            Log("Play requested but game executable is missing; installing game.");
+            await UpdateAsync(false);
+            if (!File.Exists(GamePath)) return;
+        }
+        try
+        {
+            gameProcess = Process.Start(new ProcessStartInfo(GamePath) { WorkingDirectory = GameRoot, UseShellExecute = true });
+            playButton.Enabled = false;
+            statusLabel.Text = "Game running.";
+            Log($"Game started: {GamePath}");
+        }
+        catch (Exception ex) { statusLabel.Text = "Failed to start game: " + ex.Message; Log("Game start failed: " + ex); }
     }
 
     private async Task UpdateAsync(bool manual)
     {
-        if (busy) return; busy = true;
+        if (busy) return;
+        busy = true;
+        SetActionButtons(false);
+        string work = Path.Combine(Path.GetTempPath(), "InfiniteAscensionUpdate", Guid.NewGuid().ToString("N"));
+        string staging = Path.Combine(InstallRoot, "Game.next");
+        string rollback = Path.Combine(InstallRoot, "Game.rollback");
         try
         {
-            if (gameProcess is { HasExited: false }) { gameProcess.Kill(true); gameProcess.Dispose(); gameProcess = null; }
-            await RefreshManifestAsync();
-            if (!manual && remoteBuild <= localBuild) { statusLabel.Text = "Game is up to date."; return; }
+            if (gameProcess is { HasExited: false })
+            {
+                Log("Stopping running game before update.");
+                gameProcess.Kill(true); gameProcess.Dispose(); gameProcess = null;
+            }
 
-            using var manifestResponse = await http.GetAsync(ManifestUrl); manifestResponse.EnsureSuccessStatusCode();
-            using var manifest = JsonDocument.Parse(await manifestResponse.Content.ReadAsStringAsync()); var root = manifest.RootElement;
+            await RefreshManifestAsync();
+            using var manifestResponse = await http.GetAsync(ManifestUrl + "?nocache=" + Guid.NewGuid().ToString("N"));
+            string manifestBody = await manifestResponse.Content.ReadAsStringAsync();
+            if (!manifestResponse.IsSuccessStatusCode) throw new HttpRequestException($"Manifest HTTP {(int)manifestResponse.StatusCode}: {TrimForUi(manifestBody)}");
+            using var manifest = JsonDocument.Parse(manifestBody); var root = manifest.RootElement;
+
             var windows = root.GetProperty("assets").GetProperty("windows");
             var gameUrl = windows.GetProperty("url").GetString() ?? throw new InvalidOperationException("Manifest missing Windows game URL.");
             var expectedSha = windows.GetProperty("sha256").GetString()?.Trim().ToLowerInvariant() ?? throw new InvalidOperationException("Manifest missing Windows game SHA-256.");
-            var targetBuild = root.GetProperty("build").GetInt32(); var targetCommit = root.GetProperty("commit").GetString() ?? "";
+            var targetBuild = root.GetProperty("build").GetInt32();
+            var targetCommit = root.GetProperty("commit").GetString() ?? "";
+            if (targetBuild < 1 || targetCommit.Length != 40 || !targetCommit.All(Uri.IsHexDigit)) throw new InvalidOperationException("Manifest contains an invalid game build or commit.");
             if (expectedSha.Length != 64 || !expectedSha.All(Uri.IsHexDigit)) throw new InvalidOperationException("Manifest contains an invalid game SHA-256.");
+            if (!Uri.TryCreate(gameUrl, UriKind.Absolute, out var gameUri) || gameUri.Scheme != Uri.UriSchemeHttps) throw new InvalidOperationException("Manifest game URL must use HTTPS.");
 
-            string work = Path.Combine(Path.GetTempPath(), "InfiniteAscensionUpdate", Guid.NewGuid().ToString("N"));
-            string zipPath = Path.Combine(work, "game.zip"); string staging = Path.Combine(InstallRoot, "Game.next"); string rollback = Path.Combine(InstallRoot, "Game.rollback");
-            Directory.CreateDirectory(work); statusLabel.Text = "Downloading game update...";
-            await DownloadAsync(gameUrl, zipPath);
+            if (!manual && localBuild > 0 && targetBuild <= localBuild)
+            {
+                statusLabel.Text = "Game is up to date.";
+                return;
+            }
+
+            string zipPath = Path.Combine(work, "game.zip");
+            Directory.CreateDirectory(work);
+            if (Directory.Exists(staging)) Directory.Delete(staging, true);
+            Directory.CreateDirectory(staging);
+            statusLabel.Text = $"Downloading game build {targetBuild}...";
+            Log($"Game update download: build={targetBuild}, url={gameUrl}");
+            await DownloadAsync(gameUri, zipPath);
+
             var actualSha = await ComputeSha256Async(zipPath);
+            Log($"Game SHA-256: expected={expectedSha}, actual={actualSha}");
             if (!CryptographicOperations.FixedTimeEquals(Convert.FromHexString(actualSha), Convert.FromHexString(expectedSha))) throw new InvalidOperationException("Game package SHA-256 mismatch.");
 
-            if (Directory.Exists(staging)) Directory.Delete(staging, true); Directory.CreateDirectory(staging); progressLabel.Text = "Extracting update...";
-            ZipFile.ExtractToDirectory(zipPath, staging, true); EnsureGamePayload(staging);
-            if (Directory.Exists(rollback)) Directory.Delete(rollback, true); if (Directory.Exists(GameRoot)) Directory.Move(GameRoot, rollback); Directory.Move(staging, GameRoot);
-            File.WriteAllText(Path.Combine(GameRoot, "build.json"), JsonSerializer.Serialize(new { build = targetBuild, commit = targetCommit, platform = "windows" }));
-            if (Directory.Exists(rollback)) Directory.Delete(rollback, true); localBuild = targetBuild; remoteCommit = targetCommit; progress.Value = 100;
-            buildLabel.Text = $"Build {localBuild} → {remoteBuild}"; statusLabel.Text = manual ? "Update complete. Game ready." : "Update complete."; progressLabel.Text = "Update complete.";
-            try { Directory.Delete(work, true); } catch { }
+            progressLabel.Text = "Extracting update...";
+            ZipFile.ExtractToDirectory(zipPath, staging, true);
+            EnsureGamePayload(staging);
+
+            if (Directory.Exists(rollback)) Directory.Delete(rollback, true);
+            if (Directory.Exists(GameRoot)) Directory.Move(GameRoot, rollback);
+            Directory.Move(staging, GameRoot);
+            File.WriteAllText(Path.Combine(GameRoot, "build.json"), JsonSerializer.Serialize(new { build = targetBuild, commit = targetCommit, platform = "windows" }, new JsonSerializerOptions { WriteIndented = true }));
+            if (Directory.Exists(rollback)) Directory.Delete(rollback, true);
+
+            localBuild = targetBuild; remoteBuild = targetBuild; remoteCommit = targetCommit; progress.Value = 100;
+            buildLabel.Text = $"Build {localBuild} → {remoteBuild}";
+            statusLabel.Text = manual ? "Update complete. Game ready." : "Update complete.";
+            progressLabel.Text = "Update complete.";
+            Log($"Game update committed: build={targetBuild}");
             if (manual) await PlayAsync();
         }
-        catch (Exception ex) { statusLabel.Text = "Update failed: " + ex.Message; progressLabel.Text = ex.ToString(); }
-        finally { busy = false; }
+        catch (Exception ex)
+        {
+            statusLabel.Text = "Update failed: " + TrimForUi(ex.Message);
+            progressLabel.Text = ex.ToString();
+            Log("Game update failed: " + ex);
+        }
+        finally
+        {
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, true); } catch { }
+            try { if (Directory.Exists(work)) Directory.Delete(work, true); } catch { }
+            SetActionButtons(true);
+            busy = false;
+        }
     }
 
     private async Task RepairAsync()
     {
-        if (busy) return; await UpdateAsync(true);
+        if (busy) return;
+        Log("Repair requested: forcing a fresh verified game package install.");
+        await UpdateAsync(true);
     }
 
     private static void EnsureGamePayload(string root)
@@ -201,22 +285,32 @@ internal sealed class LauncherForm : Form
         var sourceRoot = Path.GetDirectoryName(found)!;
         foreach (var path in Directory.EnumerateFileSystemEntries(sourceRoot))
         {
-            var dest = Path.Combine(root, Path.GetFileName(path)); if (Directory.Exists(path)) Directory.Move(path, dest); else File.Move(path, dest, true);
+            var dest = Path.Combine(root, Path.GetFileName(path));
+            if (Directory.Exists(path)) Directory.Move(path, dest); else File.Move(path, dest, true);
         }
+        if (!File.Exists(Path.Combine(root, GameExe))) throw new InvalidOperationException($"Unable to normalize {GameExe} payload.");
     }
 
-    private async Task DownloadAsync(string url, string target)
+    private async Task DownloadAsync(Uri uri, string target)
     {
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps) throw new InvalidOperationException("Distribution URL must use HTTPS.");
-        using var request = new HttpRequestMessage(HttpMethod.Get, uri); request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
-        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead); response.EnsureSuccessStatusCode();
-        var total = response.Content.Headers.ContentLength ?? -1; await using var source = await response.Content.ReadAsStreamAsync(); await using var destination = File.Create(target);
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
+        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        if (!response.IsSuccessStatusCode) throw new HttpRequestException($"Game download HTTP {(int)response.StatusCode}: {TrimForUi(await response.Content.ReadAsStringAsync())}");
+        var total = response.Content.Headers.ContentLength ?? -1;
+        await using var source = await response.Content.ReadAsStreamAsync();
+        await using var destination = File.Create(target);
         var buffer = new byte[1024 * 1024]; long readTotal = 0; int read;
         while ((read = await source.ReadAsync(buffer)) > 0)
         {
             await destination.WriteAsync(buffer.AsMemory(0, read)); readTotal += read;
-            if (total > 0) { var percent = (int)Math.Clamp(readTotal * 100L / total, 0, 100); progress.Value = percent; progressLabel.Text = $"Downloading update… {percent}%"; }
+            if (total > 0)
+            {
+                var percent = (int)Math.Clamp(readTotal * 100L / total, 0, 100);
+                progress.Value = percent; progressLabel.Text = $"Downloading update… {percent}%";
+            }
         }
+        if (new FileInfo(target).Length == 0) throw new InvalidOperationException("Downloaded game package is empty.");
     }
 
     private static async Task<string> ComputeSha256Async(string path)
@@ -226,12 +320,25 @@ internal sealed class LauncherForm : Form
 
     private void StopGame()
     {
-        try { if (gameProcess is { HasExited: false }) gameProcess.Kill(true); gameProcess = null; playButton.Enabled = true; statusLabel.Text = "Game stopped."; } catch (Exception ex) { statusLabel.Text = "Stop failed: " + ex.Message; }
+        try
+        {
+            if (gameProcess is { HasExited: false }) gameProcess.Kill(true);
+            gameProcess?.Dispose(); gameProcess = null; playButton.Enabled = true; statusLabel.Text = "Game stopped."; Log("Game stopped.");
+        }
+        catch (Exception ex) { statusLabel.Text = "Stop failed: " + ex.Message; Log("Game stop failed: " + ex); }
     }
 
     private void RefreshGameState()
     {
-        try { if (gameProcess?.HasExited == true) { gameProcess.Dispose(); gameProcess = null; playButton.Enabled = true; statusLabel.Text = "Game exited."; } } catch { }
+        try
+        {
+            if (gameProcess?.HasExited == true)
+            {
+                int code = gameProcess.ExitCode;
+                gameProcess.Dispose(); gameProcess = null; playButton.Enabled = true; statusLabel.Text = code == 0 ? "Game exited." : $"Game exited with code {code}."; Log($"Game exited: code={code}");
+            }
+        }
+        catch (Exception ex) { Log("Game state check failed: " + ex.Message); }
     }
 
     private void OpenGameFolder()
@@ -241,7 +348,30 @@ internal sealed class LauncherForm : Form
 
     private void OpenLogs()
     {
-        var path = Path.Combine(InstallRoot, "launcher.log"); if (!File.Exists(path)) File.WriteAllText(path, "Launcher log initialized.\n");
-        Process.Start(new ProcessStartInfo("notepad.exe", path) { UseShellExecute = true });
+        Directory.CreateDirectory(InstallRoot);
+        if (!File.Exists(LogPath)) File.WriteAllText(LogPath, "Launcher log initialized.\n");
+        Process.Start(new ProcessStartInfo("notepad.exe", LogPath) { UseShellExecute = true });
     }
+
+    private void SetActionButtons(bool enabled)
+    {
+        playButton.Enabled = enabled && gameProcess is null;
+        updateButton.Enabled = enabled;
+        repairButton.Enabled = enabled;
+        folderButton.Enabled = enabled;
+        githubButton.Enabled = enabled;
+        stopButton.Enabled = enabled && gameProcess is { HasExited: false };
+    }
+
+    private void Log(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(InstallRoot);
+            File.AppendAllText(LogPath, $"[{DateTime.Now:O}] {message}{Environment.NewLine}", Encoding.UTF8);
+        }
+        catch { }
+    }
+
+    private static string TrimForUi(string value) => value.Length <= 500 ? value : value[..500] + "…";
 }
