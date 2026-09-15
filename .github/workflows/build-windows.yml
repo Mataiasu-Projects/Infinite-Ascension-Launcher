@@ -63,6 +63,7 @@ jobs:
       - name: Smoke test launcher process
         shell: pwsh
         run: |
+          $env:INFINITE_ASCENSION_SKIP_SELF_UPDATE = '1'
           $exe = (Resolve-Path 'artifacts/launcher-windows/Infinite-Ascension-Launcher.exe').Path
           $p = Start-Process -FilePath $exe -PassThru
           Start-Sleep -Seconds 5
