@@ -10,8 +10,6 @@ namespace InfiniteAscensionLauncher;
 internal static class LauncherSelfUpdater
 {
     private const string ManifestUrl = "https://infinite-ascension-updater.matthprizee55.workers.dev/update/manifest";
-    private const string GitHubManifestUrl = "https://github.com/Mataiasu-Projects/Infinite-Ascension/releases/download/latest/manifest.json";
-    private const string GitHubLauncherUrl = "https://github.com/Mataiasu-Projects/Infinite-Ascension/releases/download/latest/Infinite-Ascension-Launcher-Windows.zip";
     private const string LauncherExe = "Infinite-Ascension-Launcher.exe";
     private const string BuildFile = "launcher_build.json";
     private const string BackupExe = "Infinite-Ascension-Launcher.rollback.exe";
@@ -41,49 +39,37 @@ internal static class LauncherSelfUpdater
         TryLog($"Self-update check: localBuild={localBuild}, exe={exe}");
 
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
-        JsonDocument? manifest;
-        try
-        {
-            manifest = DownloadManifest(http, ManifestUrl + "?nocache=" + Guid.NewGuid().ToString("N"));
-            TryLog("Manifest source: updater worker");
-        }
-        catch (Exception ex)
-        {
-            TryLog($"Worker manifest failed, using GitHub fallback: {ex.Message}");
-            manifest = DownloadManifest(http, GitHubManifestUrl + "?nocache=" + Guid.NewGuid().ToString("N"));
-            TryLog("Manifest source: GitHub release");
-        }
+        using var manifest = DownloadManifest(http, ManifestUrl + "?nocache=" + Guid.NewGuid().ToString("N"));
+        TryLog("Manifest source: updater worker");
 
-        using (manifest)
-        {
-            var root = manifest.RootElement;
-            if (!root.TryGetProperty("build", out var buildElement) || !buildElement.TryGetInt32(out int remoteBuild))
-                throw new InvalidOperationException("Launcher manifest has no valid build number.");
-            string remoteCommit = root.TryGetProperty("commit", out var commitElement) ? commitElement.GetString() ?? "" : "";
-            if (remoteBuild <= localBuild) { TryLog($"No launcher update required: remoteBuild={remoteBuild}"); return; }
+        var root = manifest.RootElement;
+        if (!root.TryGetProperty("build", out var buildElement) || !buildElement.TryGetInt32(out int remoteBuild))
+            throw new InvalidOperationException("Launcher manifest has no valid build number.");
+        string remoteCommit = root.TryGetProperty("commit", out var commitElement) ? commitElement.GetString() ?? "" : "";
+        if (remoteBuild <= localBuild) { TryLog($"No launcher update required: remoteBuild={remoteBuild}"); return; }
 
-            string url = GitHubLauncherUrl;
-            string expectedSha = "";
-            if (root.TryGetProperty("assets", out var assets) && assets.TryGetProperty("launcher_windows", out var asset))
+        string url = "";
+        string expectedSha = "";
+        if (root.TryGetProperty("assets", out var assets) && assets.TryGetProperty("launcher_windows", out var asset))
+        {
+            expectedSha = asset.TryGetProperty("sha256", out var shaElement) ? shaElement.GetString() ?? "" : "";
+            if (asset.TryGetProperty("url", out var urlElement))
             {
-                expectedSha = asset.TryGetProperty("sha256", out var shaElement) ? shaElement.GetString() ?? "" : "";
-                if (asset.TryGetProperty("url", out var urlElement))
-                {
-                    string candidate = urlElement.GetString() ?? "";
-                    if (Uri.TryCreate(candidate, UriKind.Absolute, out var candidateUri) && candidateUri.Scheme == Uri.UriSchemeHttps)
-                        url = candidate;
-                }
+                string candidate = urlElement.GetString() ?? "";
+                if (Uri.TryCreate(candidate, UriKind.Absolute, out var candidateUri) && candidateUri.Scheme == Uri.UriSchemeHttps)
+                    url = candidate;
             }
-            if (!IsSha256(expectedSha)) throw new InvalidOperationException("Launcher manifest has no valid SHA-256.");
-            TryLog($"Launcher update available: local={localBuild}, remote={remoteBuild}");
-            ApplyUpdate(http, exe, installDir, remoteBuild, remoteCommit, url, expectedSha);
         }
+        if (string.IsNullOrWhiteSpace(url)) throw new InvalidOperationException("Launcher manifest has no HTTPS update URL.");
+        if (!IsSha256(expectedSha)) throw new InvalidOperationException("Launcher manifest has no valid SHA-256.");
+        TryLog($"Launcher update available: local={localBuild}, remote={remoteBuild}");
+        ApplyUpdate(http, exe, installDir, remoteBuild, remoteCommit, url, expectedSha);
     }
 
     private static JsonDocument DownloadManifest(HttpClient http, string url)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.UserAgent.ParseAdd("Infinite-Ascension-Launcher-SelfUpdater/5.1");
+        request.Headers.UserAgent.ParseAdd("Infinite-Ascension-Launcher-SelfUpdater/5.2");
         request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true, NoStore = true };
         using var response = http.Send(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
