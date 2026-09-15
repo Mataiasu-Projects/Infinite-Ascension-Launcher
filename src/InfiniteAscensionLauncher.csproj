@@ -8,7 +8,6 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <AssemblyName>Infinite-Ascension-Launcher</AssemblyName>
     <RootNamespace>InfiniteAscensionLauncher</RootNamespace>
-    <ApplicationIcon>Assets\infinite-ascension.ico</ApplicationIcon>
     <LauncherBuild Condition="'$(GITHUB_RUN_NUMBER)' == ''">0</LauncherBuild>
     <LauncherBuild Condition="'$(GITHUB_RUN_NUMBER)' != ''">$(GITHUB_RUN_NUMBER)</LauncherBuild>
     <LauncherCommit Condition="'$(GITHUB_SHA)' == ''">local</LauncherCommit>
@@ -17,14 +16,7 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="LauncherSelfUpdater.cs" />
-    <Content Include="Assets\*.png">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
-    </Content>
   </ItemGroup>
-  <Target Name="GenerateLauncherIcon" BeforeTargets="BeforeBuild">
-    <Exec Command="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\GenerateLauncherIcon.ps1&quot;" />
-  </Target>
   <Target Name="WriteLauncherBuildInfo" AfterTargets="Publish">
     <WriteLinesToFile File="$(PublishDir)launcher_build.json" Lines="{&quot;build&quot;:$(LauncherBuild),&quot;commit&quot;:&quot;$(LauncherCommit)&quot;,&quot;platform&quot;:&quot;windows&quot;}" Overwrite="true" Encoding="UTF-8" />
   </Target>
