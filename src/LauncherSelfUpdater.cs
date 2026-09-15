@@ -43,9 +43,8 @@ internal static class LauncherSelfUpdater
         TryLog("Manifest source: updater worker");
 
         var root = manifest.RootElement;
-        if (!root.TryGetProperty("build", out var buildElement) || !buildElement.TryGetInt32(out int remoteBuild))
-            throw new InvalidOperationException("Launcher manifest has no valid build number.");
-        string remoteCommit = root.TryGetProperty("commit", out var commitElement) ? commitElement.GetString() ?? "" : "";
+        if (!root.TryGetProperty("launcher_build", out var buildElement) || !buildElement.TryGetInt32(out int remoteBuild) || remoteBuild < 1)
+            throw new InvalidOperationException("Launcher manifest has no valid launcher_build.");
         if (remoteBuild <= localBuild) { TryLog($"No launcher update required: remoteBuild={remoteBuild}"); return; }
 
         string url = "";
@@ -63,20 +62,20 @@ internal static class LauncherSelfUpdater
         if (string.IsNullOrWhiteSpace(url)) throw new InvalidOperationException("Launcher manifest has no HTTPS update URL.");
         if (!IsSha256(expectedSha)) throw new InvalidOperationException("Launcher manifest has no valid SHA-256.");
         TryLog($"Launcher update available: local={localBuild}, remote={remoteBuild}");
-        ApplyUpdate(http, exe, installDir, remoteBuild, remoteCommit, url, expectedSha);
+        ApplyUpdate(http, exe, installDir, remoteBuild, url, expectedSha);
     }
 
     private static JsonDocument DownloadManifest(HttpClient http, string url)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.UserAgent.ParseAdd("Infinite-Ascension-Launcher-SelfUpdater/5.2");
+        request.Headers.UserAgent.ParseAdd("Infinite-Ascension-Launcher-SelfUpdater/5.3");
         request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true, NoStore = true };
         using var response = http.Send(request, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
         return JsonDocument.Parse(response.Content.ReadAsStream());
     }
 
-    private static void ApplyUpdate(HttpClient http, string exe, string installDir, int remoteBuild, string remoteCommit, string updateUrl, string expectedSha)
+    private static void ApplyUpdate(HttpClient http, string exe, string installDir, int remoteBuild, string updateUrl, string expectedSha)
     {
         string tempRoot = Path.Combine(Path.GetTempPath(), "InfiniteAscensionLauncherUpdate", Guid.NewGuid().ToString("N"));
         string archive = Path.Combine(tempRoot, "launcher.zip");
@@ -97,8 +96,9 @@ internal static class LauncherSelfUpdater
             if (archiveInfo.Length < 5L * 1024L * 1024L) throw new InvalidOperationException("Launcher update archive is unexpectedly small.");
             using (var shaStream = File.OpenRead(archive))
             {
-                string actualSha = Convert.ToHexString(SHA256.HashData(shaStream)).ToLowerInvariant();
-                if (!CryptographicOperations.FixedTimeEquals(Convert.FromHexString(actualSha), Convert.FromHexString(expectedSha.ToLowerInvariant())))
+                byte[] actual = SHA256.HashData(shaStream);
+                byte[] expected = Convert.FromHexString(expectedSha);
+                if (!CryptographicOperations.FixedTimeEquals(actual, expected))
                     throw new InvalidOperationException("Launcher update SHA-256 mismatch.");
             }
             ExtractSafe(archive, unpack);
@@ -115,7 +115,6 @@ internal static class LauncherSelfUpdater
             string escapedExe = exe.Replace("'", "''");
             string escapedNewExe = newExe.Replace("'", "''");
             string escapedTemp = tempRoot.Replace("'", "''");
-            string escapedCommit = remoteCommit.Replace("'", "''");
             string escapedBuildFile = BuildFile.Replace("'", "''");
             string escapedBackupExe = BackupExe.Replace("'", "''");
             string escapedBackupBuild = BackupBuildFile.Replace("'", "''");
@@ -137,7 +136,7 @@ try {{
   Copy-Item -LiteralPath $exe -Destination $backup -Force
   if(Test-Path $buildFile){{Copy-Item -LiteralPath $buildFile -Destination $backupBuild -Force}}
   Copy-Item -LiteralPath $newExe -Destination $exe -Force
-  Set-Content -LiteralPath $buildFile -Value '{{""build"":{remoteBuild},""commit"":""{escapedCommit}"",""platform"":""windows""}}' -Encoding UTF8
+  Set-Content -LiteralPath $buildFile -Value '{{""build"":{remoteBuild},""platform"":""windows""}}' -Encoding UTF8
   $env:INFINITE_ASCENSION_UPDATING='1'
   $p=Start-Process -FilePath $exe -WorkingDirectory $install -PassThru
   $deadline=(Get-Date).AddSeconds({StartupValidationSeconds})
