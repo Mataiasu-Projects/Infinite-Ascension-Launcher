@@ -1,0 +1,61 @@
+name: Build Windows Launcher
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - name: Validate canonical launcher sources
+        shell: pwsh
+        run: |
+          $required = @(
+            'src/Program.cs',
+            'src/LauncherSelfUpdater.cs',
+            'src/InfiniteAscensionLauncher.csproj'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Missing canonical launcher source: $path" }
+          }
+          $project = Get-Content 'src/InfiniteAscensionLauncher.csproj' -Raw
+          if ($project -notmatch 'Compile Include="Program\.cs"') { throw 'Program.cs is not compiled.' }
+          if ($project -match 'LauncherV3\.cs') { throw 'Legacy LauncherV3.cs must not be compiled.' }
+
+      - name: Publish launcher
+        shell: pwsh
+        run: |
+          dotnet publish src/InfiniteAscensionLauncher.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishReadyToRun=true -p:DebugType=None -p:DebugSymbols=false -o artifacts/launcher-windows
+
+      - name: Verify launcher binary
+        shell: pwsh
+        run: |
+          $exe = 'artifacts/launcher-windows/Infinite-Ascension-Launcher.exe'
+          if (-not (Test-Path $exe)) { throw 'Launcher executable was not produced.' }
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          if ($bytes.Length -lt 10MB) { throw 'Launcher executable is unexpectedly small.' }
+          $utf8 = [Text.Encoding]::UTF8.GetString($bytes)
+          $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
+          if (($utf8 -notmatch 'GAME_UPDATE_TRANSACTION_V2') -and ($utf16 -notmatch 'GAME_UPDATE_TRANSACTION_V2')) { throw 'Canonical updater marker missing from launcher binary.' }
+          if (($utf8 -match 'LauncherV3Form') -or ($utf16 -match 'LauncherV3Form')) { throw 'Legacy LauncherV3Form detected in launcher binary.' }
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+
+      - name: Upload launcher artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Infinite-Ascension-Launcher-Windows
+          path: artifacts/launcher-windows/
+          if-no-files-found: error
