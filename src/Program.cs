@@ -24,7 +24,7 @@ internal sealed class LauncherForm : Form
     private const string WorkerBaseUrl = "https://infinite-ascension-updater.matthprizee55.workers.dev";
     private const string ManifestUrl = WorkerBaseUrl + "/update/manifest";
     private const string GameExe = "InfiniteAscension.exe";
-    private const string GitHubUrl = "https://github.com/Mataiasu-Projects/Infinite-Ascension";
+    private const string GitHubUrl = "https://github.com/Mataiasu-Projects/Infinite-Ascension-Launcher";
 
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromMinutes(15) };
     private readonly Label serverLabel = new(), buildLabel = new(), statusLabel = new(), progressLabel = new();
@@ -216,55 +216,65 @@ internal sealed class LauncherForm : Form
             if (Directory.Exists(rollback)) Directory.Delete(rollback, true); if (Directory.Exists(GameRoot)) Directory.Move(GameRoot, rollback); Directory.Move(staging, GameRoot);
             File.WriteAllText(Path.Combine(GameRoot, "build.json"), JsonSerializer.Serialize(new { build = targetBuild, commit = targetCommit, platform = "windows" }, new JsonSerializerOptions { WriteIndented = true })); if (Directory.Exists(rollback)) Directory.Delete(rollback, true);
             localBuild = targetBuild; remoteBuild = targetBuild; remoteCommit = targetCommit; progress.Value = 100; buildLabel.Text = $"Build {localBuild}  →  {remoteBuild}";
-            statusLabel.Text = manual ? "Update complete. Game ready." : "Update complete."; progressLabel.Text = "Verified update complete."; Log($"Game update committed: build={targetBuild}"); if (manual) await PlayAsync();
+            statusLabel.Text = manual ? "Update complete. Game ready." : "Update complete.";
         }
-        catch (Exception ex) { statusLabel.Text = "Update failed: " + TrimForUi(ex.Message); progressLabel.Text = "See Logs for details."; Log("Game update failed: " + ex); }
-        finally
-        {
-            try { if (Directory.Exists(staging)) Directory.Delete(staging, true); } catch { } try { if (Directory.Exists(work)) Directory.Delete(work, true); } catch { } SetActionButtons(true); busy = false;
-        }
+        catch (Exception ex) { progress.Value = 0; statusLabel.Text = "Update failed: " + TrimForUi(ex.Message); Log("Update failed: " + ex); }
+        finally { try { if (Directory.Exists(work)) Directory.Delete(work, true); } catch { } busy = false; SetActionButtons(true); RefreshGameState(); }
     }
 
-    private async Task RepairAsync() { if (busy) return; Log("Repair requested: forcing a fresh verified game package install."); await UpdateAsync(true); }
-
-    private static void EnsureGamePayload(string root)
+    private async Task RepairAsync()
     {
-        var direct = Path.Combine(root, GameExe); if (File.Exists(direct)) return; var found = Directory.EnumerateFiles(root, GameExe, SearchOption.AllDirectories).FirstOrDefault(); if (found == null) throw new InvalidOperationException($"Package does not contain {GameExe}.");
-        var sourceRoot = Path.GetDirectoryName(found)!; foreach (var path in Directory.EnumerateFileSystemEntries(sourceRoot)) { var dest = Path.Combine(root, Path.GetFileName(path)); if (Directory.Exists(path)) Directory.Move(path, dest); else File.Move(path, dest, true); }
-        if (!File.Exists(Path.Combine(root, GameExe))) throw new InvalidOperationException($"Unable to normalize {GameExe} payload.");
+        if (busy) return; await UpdateAsync(true);
     }
 
-    private async Task DownloadAsync(Uri uri, string target)
+    private async Task DownloadAsync(Uri uri, string destination)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, uri); request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream")); using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-        if (!response.IsSuccessStatusCode) throw new HttpRequestException($"Game download HTTP {(int)response.StatusCode}: {TrimForUi(await response.Content.ReadAsStringAsync())}");
-        var total = response.Content.Headers.ContentLength ?? -1; await using var source = await response.Content.ReadAsStreamAsync(); await using var destination = File.Create(target); var buffer = new byte[1024 * 1024]; long readTotal = 0; int read;
-        while ((read = await source.ReadAsync(buffer)) > 0) { await destination.WriteAsync(buffer.AsMemory(0, read)); readTotal += read; if (total > 0) { var percent = (int)Math.Clamp(readTotal * 100L / total, 0, 100); progress.Value = percent; progressLabel.Text = $"Downloading verified package… {percent}%"; } }
-        if (new FileInfo(target).Length == 0) throw new InvalidOperationException("Downloaded game package is empty.");
+        using var response = await http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead); response.EnsureSuccessStatusCode();
+        await using var input = await response.Content.ReadAsStreamAsync(); await using var output = File.Create(destination);
+        long? total = response.Content.Headers.ContentLength; long done = 0; byte[] buffer = new byte[1024 * 128]; int read;
+        while ((read = await input.ReadAsync(buffer)) > 0) { await output.WriteAsync(buffer.AsMemory(0, read)); done += read; if (total.HasValue && total.Value > 0) progress.Value = Math.Min(99, (int)(done * 100 / total.Value)); }
     }
 
-    private static async Task<string> ComputeSha256Async(string path) { await using var stream = File.OpenRead(path); return Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant(); }
-
-    private void StopGame()
+    private static async Task<string> ComputeSha256Async(string path)
     {
-        try { if (gameProcess is { HasExited: false }) gameProcess.Kill(true); gameProcess?.Dispose(); gameProcess = null; playButton.Enabled = true; statusLabel.Text = "Game stopped."; Log("Game stopped."); }
-        catch (Exception ex) { statusLabel.Text = "Stop failed: " + ex.Message; Log("Game stop failed: " + ex); }
+        using var sha = SHA256.Create(); await using var stream = File.OpenRead(path); return Convert.ToHexString(await sha.ComputeHashAsync(stream)).ToLowerInvariant();
+    }
+
+    private static void EnsureGamePayload(string directory)
+    {
+        if (!File.Exists(Path.Combine(directory, GameExe))) throw new InvalidOperationException("Verified package does not contain InfiniteAscension.exe.");
+    }
+
+    private void SetActionButtons(bool enabled)
+    {
+        playButton.Enabled = enabled && gameProcess is not { HasExited: false }; updateButton.Enabled = enabled; repairButton.Enabled = enabled; stopButton.Enabled = gameProcess is { HasExited: false }; folderButton.Enabled = enabled; githubButton.Enabled = enabled;
     }
 
     private void RefreshGameState()
     {
-        try { if (gameProcess?.HasExited == true) { int code = gameProcess.ExitCode; gameProcess.Dispose(); gameProcess = null; playButton.Enabled = true; statusLabel.Text = code == 0 ? "Game exited." : $"Game exited with code {code}."; Log($"Game exited: code={code}"); } }
-        catch (Exception ex) { Log("Game state check failed: " + ex.Message); }
+        if (gameProcess is { HasExited: true }) { gameProcess.Dispose(); gameProcess = null; playButton.Enabled = !busy; statusLabel.Text = "Game stopped. Ready to play."; }
+        stopButton.Enabled = gameProcess is { HasExited: false };
     }
 
-    private void OpenGameFolder() { Directory.CreateDirectory(GameRoot); Process.Start(new ProcessStartInfo("explorer.exe", GameRoot) { UseShellExecute = true }); }
-    private void OpenLogs() { Directory.CreateDirectory(InstallRoot); if (!File.Exists(LogPath)) File.WriteAllText(LogPath, "Launcher log initialized.\n"); Process.Start(new ProcessStartInfo("notepad.exe", LogPath) { UseShellExecute = true }); }
-
-    private void SetActionButtons(bool enabled)
+    private void StopGame()
     {
-        playButton.Enabled = enabled && gameProcess is null; updateButton.Enabled = enabled; repairButton.Enabled = enabled; folderButton.Enabled = enabled; githubButton.Enabled = enabled; stopButton.Enabled = enabled && gameProcess is { HasExited: false };
+        try { if (gameProcess is { HasExited: false }) gameProcess.Kill(true); } catch (Exception ex) { Log("Stop game failed: " + ex); }
     }
 
-    private void Log(string message) { try { Directory.CreateDirectory(InstallRoot); File.AppendAllText(LogPath, $"[{DateTime.Now:O}] {message}{Environment.NewLine}", Encoding.UTF8); } catch { } }
-    private static string TrimForUi(string value) => value.Length <= 500 ? value : value[..500] + "…";
+    private void OpenGameFolder()
+    {
+        Directory.CreateDirectory(GameRoot); Process.Start(new ProcessStartInfo("explorer.exe", GameRoot) { UseShellExecute = true });
+    }
+
+    private void OpenLogs()
+    {
+        Directory.CreateDirectory(InstallRoot); if (!File.Exists(LogPath)) File.WriteAllText(LogPath, ""); Process.Start(new ProcessStartInfo("notepad.exe", LogPath) { UseShellExecute = true });
+    }
+
+    private void Log(string message)
+    {
+        try { Directory.CreateDirectory(InstallRoot); File.AppendAllText(LogPath, $"[{DateTimeOffset.Now:O}] {message}{Environment.NewLine}"); } catch { }
+    }
+
+    private static string TrimForUi(string value) => value.Length <= 240 ? value : value[..240] + "…";
 }
