@@ -24,12 +24,11 @@ internal sealed class LauncherForm : Form
     private const string WorkerBaseUrl = "https://infinite-ascension-updater.matthprizee55.workers.dev";
     private const string ManifestUrl = WorkerBaseUrl + "/update/manifest";
     private const string GameExe = "InfiniteAscension.exe";
-    private const string GitHubUrl = "https://github.com/Mataiasu-Projects/Infinite-Ascension-Launcher";
 
     private readonly HttpClient http = new() { Timeout = TimeSpan.FromMinutes(15) };
     private readonly Label serverLabel = new(), buildLabel = new(), statusLabel = new(), progressLabel = new();
     private readonly ProgressBar progress = new();
-    private readonly Button playButton = new(), updateButton = new(), stopButton = new(), folderButton = new(), repairButton = new(), githubButton = new();
+    private readonly Button playButton = new(), updateButton = new(), stopButton = new(), folderButton = new(), repairButton = new();
     private readonly Panel content = new(), nav = new(), home = new();
     private readonly System.Windows.Forms.Timer gameTimer = new() { Interval = 1000 };
     private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 300000 };
@@ -85,8 +84,8 @@ internal sealed class LauncherForm : Form
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 92, Padding = new Padding(0, 20, 0, 0), WrapContents = false, BackColor = Color.Transparent };
         ConfigureButton(playButton, "PLAY", 150, true); ConfigureButton(updateButton, "UPDATE", 135, false); ConfigureButton(repairButton, "REPAIR", 135, false);
-        ConfigureButton(stopButton, "STOP", 110, false); ConfigureButton(folderButton, "GAME FOLDER", 150, false); ConfigureButton(githubButton, "GITHUB", 120, false);
-        actions.Controls.AddRange(new Control[] { playButton, updateButton, repairButton, stopButton, folderButton, githubButton }); home.Controls.Add(actions);
+        ConfigureButton(stopButton, "STOP", 110, false); ConfigureButton(folderButton, "GAME FOLDER", 150, false);
+        actions.Controls.AddRange(new Control[] { playButton, updateButton, repairButton, stopButton, folderButton }); home.Controls.Add(actions);
 
         var info = new Panel { Dock = DockStyle.Top, Height = 108, BackColor = Color.FromArgb(19, 17, 29), Padding = new Padding(20, 16, 20, 14) };
         var infoTitle = new Label { Text = "INSTALLATION", AutoSize = true, Font = new Font("Segoe UI Semibold", 9F), ForeColor = Color.FromArgb(158, 151, 181), Location = new Point(20, 14) };
@@ -102,7 +101,6 @@ internal sealed class LauncherForm : Form
         repairButton.Click += async (_, _) => await RepairAsync();
         stopButton.Click += (_, _) => StopGame();
         folderButton.Click += (_, _) => OpenGameFolder();
-        githubButton.Click += (_, _) => Process.Start(new ProcessStartInfo(GitHubUrl) { UseShellExecute = true });
 
         Controls.Add(content); Controls.Add(nav); Controls.Add(top);
     }
@@ -216,49 +214,49 @@ internal sealed class LauncherForm : Form
             if (Directory.Exists(rollback)) Directory.Delete(rollback, true); if (Directory.Exists(GameRoot)) Directory.Move(GameRoot, rollback); Directory.Move(staging, GameRoot);
             File.WriteAllText(Path.Combine(GameRoot, "build.json"), JsonSerializer.Serialize(new { build = targetBuild, commit = targetCommit, platform = "windows" }, new JsonSerializerOptions { WriteIndented = true })); if (Directory.Exists(rollback)) Directory.Delete(rollback, true);
             localBuild = targetBuild; remoteBuild = targetBuild; remoteCommit = targetCommit; progress.Value = 100; buildLabel.Text = $"Build {localBuild}  →  {remoteBuild}";
-            statusLabel.Text = manual ? "Update complete. Game ready." : "Update complete.";
+            statusLabel.Text = manual ? "Update complete. Game ready." : "Update installed automatically. Game ready.";
         }
-        catch (Exception ex) { progress.Value = 0; statusLabel.Text = "Update failed: " + TrimForUi(ex.Message); Log("Update failed: " + ex); }
+        catch (Exception ex) { statusLabel.Text = "Update failed: " + TrimForUi(ex.Message); Log("Update failed: " + ex); }
         finally { try { if (Directory.Exists(work)) Directory.Delete(work, true); } catch { } busy = false; SetActionButtons(true); RefreshGameState(); }
     }
 
-    private async Task RepairAsync()
-    {
-        if (busy) return; await UpdateAsync(true);
-    }
+    private async Task RepairAsync() => await UpdateAsync(true);
 
     private async Task DownloadAsync(Uri uri, string destination)
     {
+        progress.Value = 0; progressLabel.Text = "Downloading verified package…";
         using var response = await http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead); response.EnsureSuccessStatusCode();
+        long? total = response.Content.Headers.ContentLength;
         await using var input = await response.Content.ReadAsStreamAsync(); await using var output = File.Create(destination);
-        long? total = response.Content.Headers.ContentLength; long done = 0; byte[] buffer = new byte[1024 * 128]; int read;
-        while ((read = await input.ReadAsync(buffer)) > 0) { await output.WriteAsync(buffer.AsMemory(0, read)); done += read; if (total.HasValue && total.Value > 0) progress.Value = Math.Min(99, (int)(done * 100 / total.Value)); }
+        byte[] buffer = new byte[1024 * 128]; long readTotal = 0; int read;
+        while ((read = await input.ReadAsync(buffer)) > 0) { await output.WriteAsync(buffer.AsMemory(0, read)); readTotal += read; if (total is > 0) progress.Value = Math.Min(100, (int)(readTotal * 100 / total.Value)); }
     }
 
     private static async Task<string> ComputeSha256Async(string path)
     {
-        using var sha = SHA256.Create(); await using var stream = File.OpenRead(path); return Convert.ToHexString(await sha.ComputeHashAsync(stream)).ToLowerInvariant();
+        await using var stream = File.OpenRead(path); return Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();
     }
 
-    private static void EnsureGamePayload(string directory)
+    private static void EnsureGamePayload(string root)
     {
-        if (!File.Exists(Path.Combine(directory, GameExe))) throw new InvalidOperationException("Verified package does not contain InfiniteAscension.exe.");
+        if (!File.Exists(Path.Combine(root, GameExe))) throw new InvalidOperationException("Verified package does not contain the game executable.");
     }
 
     private void SetActionButtons(bool enabled)
     {
-        playButton.Enabled = enabled && gameProcess is not { HasExited: false }; updateButton.Enabled = enabled; repairButton.Enabled = enabled; stopButton.Enabled = gameProcess is { HasExited: false }; folderButton.Enabled = enabled; githubButton.Enabled = enabled;
+        playButton.Enabled = enabled && gameProcess is not { HasExited: false }; updateButton.Enabled = enabled; repairButton.Enabled = enabled; stopButton.Enabled = gameProcess is { HasExited: false }; folderButton.Enabled = enabled;
     }
 
     private void RefreshGameState()
     {
-        if (gameProcess is { HasExited: true }) { gameProcess.Dispose(); gameProcess = null; playButton.Enabled = !busy; statusLabel.Text = "Game stopped. Ready to play."; }
+        if (gameProcess is { HasExited: true }) { gameProcess.Dispose(); gameProcess = null; playButton.Enabled = !busy; statusLabel.Text = "Game stopped. Ready to launch."; }
         stopButton.Enabled = gameProcess is { HasExited: false };
     }
 
     private void StopGame()
     {
-        try { if (gameProcess is { HasExited: false }) gameProcess.Kill(true); } catch (Exception ex) { Log("Stop game failed: " + ex); }
+        try { if (gameProcess is { HasExited: false }) gameProcess.Kill(true); } catch (Exception ex) { Log("Stop failed: " + ex.Message); }
+        RefreshGameState();
     }
 
     private void OpenGameFolder()
@@ -268,7 +266,8 @@ internal sealed class LauncherForm : Form
 
     private void OpenLogs()
     {
-        Directory.CreateDirectory(InstallRoot); if (!File.Exists(LogPath)) File.WriteAllText(LogPath, ""); Process.Start(new ProcessStartInfo("notepad.exe", LogPath) { UseShellExecute = true });
+        Directory.CreateDirectory(InstallRoot); if (!File.Exists(LogPath)) File.WriteAllText(LogPath, "");
+        Process.Start(new ProcessStartInfo("notepad.exe", LogPath) { UseShellExecute = true });
     }
 
     private void Log(string message)
@@ -276,5 +275,5 @@ internal sealed class LauncherForm : Form
         try { Directory.CreateDirectory(InstallRoot); File.AppendAllText(LogPath, $"[{DateTimeOffset.Now:O}] {message}{Environment.NewLine}"); } catch { }
     }
 
-    private static string TrimForUi(string value) => value.Length <= 240 ? value : value[..240] + "…";
+    private static string TrimForUi(string value) => value.Length <= 500 ? value : value[..500];
 }
