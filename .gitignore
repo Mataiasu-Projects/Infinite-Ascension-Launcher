@@ -4,3 +4,13 @@ obj/
 *.user
 *.suo
 artifacts/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+*.pem
+secrets/
