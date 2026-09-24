@@ -16,6 +16,10 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="LauncherSelfUpdater.cs" />
+    <Compile Include="LauncherForm.Ui.cs" />
+    <Compile Include="LauncherForm.Lifecycle.cs" />
+    <Compile Include="LauncherForm.Update.cs" />
+    <Compile Include="LauncherForm.Support.cs" />
   </ItemGroup>
   <Target Name="WriteLauncherBuildInfo" AfterTargets="Publish">
     <WriteLinesToFile File="$(PublishDir)launcher_build.json" Lines="{&quot;build&quot;:$(LauncherBuild),&quot;commit&quot;:&quot;$(LauncherCommit)&quot;,&quot;platform&quot;:&quot;windows&quot;}" Overwrite="true" Encoding="UTF-8" />
