@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish launcher
+        run: dotnet publish src/InfiniteAscensionLauncher.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/launcher-windows
+      - name: Verify launcher artifact
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "artifacts/launcher-windows/Infinite-Ascension-Launcher.exe")) {
+            throw "Launcher executable was not produced."
+          }
